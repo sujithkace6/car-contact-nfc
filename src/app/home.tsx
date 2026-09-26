@@ -252,19 +252,33 @@ export default function HomeScreen() {
     });
     if (!confirmed) return;
 
+    // The backend (Render free tier) can go to sleep and cold-start slowly, so
+    // the DELETE request can time out on the client even though it still reaches
+    // the server and deletes the vehicle. Rather than trust a network error at
+    // face value, re-check the vehicle list afterwards and only report failure
+    // if the vehicle is still actually there.
+    let deleteSucceeded = false;
+    let deleteErrorMessage: string | null = null;
     try {
       const response = await fetch(`${BACKEND_URL}/vehicles/${vehicle.id}`, {
         method: "DELETE",
       });
       const data = await response.json();
-      if (data.success) {
-        showToast(`${vehicle.name} was deleted.`, { title: "Deleted", type: "success" });
-        await fetchVehicles();
-      } else {
-        showToast(data.error || "Please try again.", { title: "Couldn't delete", type: "error" });
+      deleteSucceeded = !!data.success;
+      if (!deleteSucceeded) {
+        deleteErrorMessage = data.error || "Please try again.";
       }
     } catch (error) {
-      showToast("Check your internet connection and try again.", { title: "Couldn't delete", type: "error" });
+      deleteErrorMessage = "Check your internet connection and try again.";
+    }
+
+    const { vehicles: refreshed } = await fetchVehicles();
+    const stillExists = refreshed.some((v) => v.id === vehicle.id);
+
+    if (deleteSucceeded || !stillExists) {
+      showToast(`${vehicle.name} was deleted.`, { title: "Deleted", type: "success" });
+    } else {
+      showToast(deleteErrorMessage || "Please try again.", { title: "Couldn't delete", type: "error" });
     }
   }
 
