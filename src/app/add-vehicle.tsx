@@ -234,17 +234,13 @@ export default function AddVehicleScreen() {
           disabled={!canSave || verifying}
         >
           <Text style={styles.verifyButtonText}>
-            {phase === "scanning"
-              ? "Hold near tag..."
-              : phase === "writing"
-              ? "Writing..."
-              : "Verify Contact Card"}
+            {verifying ? "Verifying..." : "Verify Contact Card"}
           </Text>
         </TouchableOpacity>
 
         {phase === "scanning" && (
           <View style={styles.countdownWrapper}>
-            <Text style={styles.countdownLabel}>Hold your phone near the tag...</Text>
+            <Text style={styles.countdownLabel}>Hold the device steady</Text>
           </View>
         )}
 
@@ -253,7 +249,7 @@ export default function AddVehicleScreen() {
             <View style={styles.countdownCircle}>
               <Text style={styles.countdownNumber}>{countdown}</Text>
             </View>
-            <Text style={styles.countdownLabel}>Tag found - keep holding steady while it saves</Text>
+            <Text style={styles.countdownLabel}>Hold the device steady</Text>
           </View>
         )}
       </ScrollView>

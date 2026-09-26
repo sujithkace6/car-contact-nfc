@@ -16,6 +16,7 @@ import NfcManager, { Ndef, NfcTech } from "react-native-nfc-manager";
 import { decodeFromTag } from "../lib/tagCipher";
 import { authenticateTag } from "../lib/nfcPassword";
 import { useToast } from "../lib/toast";
+import { useConfirm } from "../lib/confirmModal";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 type Mode = "vehicle" | "family";
@@ -72,6 +73,7 @@ async function readFullNfcCode(): Promise<string> {
 export default function HomeScreen() {
   const router = useRouter();
   const { showToast } = useToast();
+  const { confirm } = useConfirm();
   const { phoneNumber: userPhoneNumber } = useLocalSearchParams<{ phoneNumber: string }>();
 
   const [mode, setMode] = useState<Mode>("vehicle");
@@ -98,33 +100,53 @@ export default function HomeScreen() {
 
   // Fetch this user's vehicles from the backend every time Home comes into focus
   // (e.g. right after saving a new vehicle and navigating back).
-  const fetchVehicles = useCallback(async () => {
-    if (!userPhoneNumber) return;
+  const fetchVehicles = useCallback(async (): Promise<{ vehicles: Vehicle[]; selectedId: string | null }> => {
+    if (!userPhoneNumber) return { vehicles: [], selectedId: null };
     try {
       const response = await fetch(
         `${BACKEND_URL}/vehicles?phoneNumber=${encodeURIComponent(userPhoneNumber)}`
       );
       const data = await response.json();
       if (data.success) {
-        setVehicles(data.vehicles);
+        const fetchedVehicles: Vehicle[] = data.vehicles;
+        setVehicles(fetchedVehicles);
+        let resolvedSelectedId: string | null = null;
         setSelectedVehicleId((current) => {
-          if (current && data.vehicles.some((v: Vehicle) => v.id === current)) {
+          if (current && fetchedVehicles.some((v) => v.id === current)) {
+            resolvedSelectedId = current;
             return current;
           }
-          return data.vehicles[0]?.id ?? null;
+          resolvedSelectedId = fetchedVehicles[0]?.id ?? null;
+          return resolvedSelectedId;
         });
         // Park Map should already be open and visible whenever a vehicle exists,
         // with no need to tap the button first.
-        setParkingPanelOpen(data.vehicles.length > 0);
+        setParkingPanelOpen(fetchedVehicles.length > 0);
+        return { vehicles: fetchedVehicles, selectedId: resolvedSelectedId };
       }
     } catch (error) {
       console.error("Could not fetch vehicles", error);
     }
+    return { vehicles: [], selectedId: null };
   }, [userPhoneNumber]);
 
+  // Every time Home comes into focus (app opened, or navigated back to), refresh
+  // the vehicle list AND immediately kick off the Park Map NFC scan for the
+  // selected vehicle - no need to tap the Park Map button first.
   useFocusEffect(
     useCallback(() => {
-      fetchVehicles();
+      let cancelled = false;
+      (async () => {
+        const { vehicles: fetched, selectedId } = await fetchVehicles();
+        if (cancelled) return;
+        const vehicleToScan = fetched.find((v) => v.id === selectedId) ?? fetched[0] ?? null;
+        if (vehicleToScan) {
+          scanToMarkParking(vehicleToScan);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
     }, [fetchVehicles])
   );
 
@@ -162,7 +184,7 @@ export default function HomeScreen() {
       return;
     }
     setParkingPanelOpen(true);
-    handleScanToMarkParking();
+    scanToMarkParking(selectedVehicle);
   }
 
   function handleRemotePark() {
@@ -171,8 +193,10 @@ export default function HomeScreen() {
     showToast(`Remote parking ${selectedVehicle.name}`, { title: "Remote Park", type: "info" });
   }
 
-  async function handleScanToMarkParking() {
-    if (!selectedVehicle) return;
+  // Takes the vehicle explicitly (rather than reading selectedVehicle state)
+  // so it can be triggered right after a fetch, before state has settled.
+  async function scanToMarkParking(vehicle: Vehicle) {
+    if (scanningPark) return;
     setScanningPark(true);
     try {
       const supported = await NfcManager.isSupported();
@@ -196,7 +220,7 @@ export default function HomeScreen() {
       const position = await Location.getCurrentPositionAsync({});
       const { latitude, longitude } = position.coords;
 
-      const response = await fetch(`${BACKEND_URL}/vehicles/${selectedVehicle.id}/park`, {
+      const response = await fetch(`${BACKEND_URL}/vehicles/${vehicle.id}/park`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pairingCode, latitude, longitude }),
@@ -215,6 +239,32 @@ export default function HomeScreen() {
       showToast(error?.message || "Something went wrong while scanning.", { title: "Error", type: "error" });
     } finally {
       setScanningPark(false);
+    }
+  }
+
+  async function handleDeleteVehicle(vehicle: Vehicle) {
+    const confirmed = await confirm({
+      title: `Delete ${vehicle.name}?`,
+      message: "For adding this vehicle again, you'll need the box code and a new tag.",
+      confirmLabel: "Delete",
+      cancelLabel: "Cancel",
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    try {
+      const response = await fetch(`${BACKEND_URL}/vehicles/${vehicle.id}`, {
+        method: "DELETE",
+      });
+      const data = await response.json();
+      if (data.success) {
+        showToast(`${vehicle.name} was deleted.`, { title: "Deleted", type: "success" });
+        await fetchVehicles();
+      } else {
+        showToast(data.error || "Please try again.", { title: "Couldn't delete", type: "error" });
+      }
+    } catch (error) {
+      showToast("Check your internet connection and try again.", { title: "Couldn't delete", type: "error" });
     }
   }
 
@@ -401,9 +451,18 @@ export default function HomeScreen() {
                               {item.vehicleNumber}
                             </Text>
                           </View>
-                          {item.id === selectedVehicleId && (
-                            <Text style={styles.checkmark}>✓</Text>
-                          )}
+                          <View style={styles.listRowActions}>
+                            {item.id === selectedVehicleId && (
+                              <Text style={styles.checkmark}>✓</Text>
+                            )}
+                            <TouchableOpacity
+                              style={styles.deleteButton}
+                              onPress={() => handleDeleteVehicle(item)}
+                              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                            >
+                              <Ionicons name="trash-outline" size={18} color="#C4453A" />
+                            </TouchableOpacity>
+                          </View>
                         </TouchableOpacity>
                       )}
                     />
@@ -669,6 +728,14 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: "#111111",
     fontWeight: "700",
+  },
+  listRowActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+  },
+  deleteButton: {
+    padding: 2,
   },
   addRow: {
     paddingVertical: 14,
