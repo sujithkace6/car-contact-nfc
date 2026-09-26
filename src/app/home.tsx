@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -89,6 +89,7 @@ export default function HomeScreen() {
 
   const [parkingPanelOpen, setParkingPanelOpen] = useState(false);
   const [scanningPark, setScanningPark] = useState(false);
+  const scanCancelledRef = useRef(false);
   const [togglingNotifications, setTogglingNotifications] = useState(false);
 
   const hasVehicles = vehicles.length > 0;
@@ -146,6 +147,14 @@ export default function HomeScreen() {
       })();
       return () => {
         cancelled = true;
+        // Home is losing focus (e.g. navigating to Add Vehicle). If a Park Map
+        // scan is still waiting for a tag, its NFC session is left open and
+        // will block any other screen's NFC request with "You can only issue
+        // one request at a time" - so cancel it here.
+        if (scanningPark) {
+          scanCancelledRef.current = true;
+          NfcManager.cancelTechnologyRequest().catch(() => {});
+        }
       };
     }, [fetchVehicles])
   );
@@ -197,6 +206,7 @@ export default function HomeScreen() {
   // so it can be triggered right after a fetch, before state has settled.
   async function scanToMarkParking(vehicle: Vehicle) {
     if (scanningPark) return;
+    scanCancelledRef.current = false;
     setScanningPark(true);
     try {
       const supported = await NfcManager.isSupported();
@@ -236,7 +246,12 @@ export default function HomeScreen() {
       showToast("We've texted you the location, and notifications are now on.", { title: "Parking marked", type: "success" });
       await fetchVehicles();
     } catch (error: any) {
-      showToast(error?.message || "Something went wrong while scanning.", { title: "Error", type: "error" });
+      // Don't show an error toast if we cancelled this scan ourselves (e.g.
+      // the user navigated away from Home before a tag was found).
+      if (!scanCancelledRef.current) {
+        showToast(error?.message || "Something went wrong while scanning.", { title: "Error", type: "error" });
+      }
+      scanCancelledRef.current = false;
     } finally {
       setScanningPark(false);
     }
@@ -467,7 +482,7 @@ export default function HomeScreen() {
                           </View>
                           <View style={styles.listRowActions}>
                             {item.id === selectedVehicleId && (
-                              <Text style={styles.checkmark}>✓</Text>
+                              <Ionicons name="checkmark-circle" size={18} color="#2E8B57" />
                             )}
                             <TouchableOpacity
                               style={styles.deleteButton}
