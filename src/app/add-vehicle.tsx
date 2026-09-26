@@ -8,12 +8,18 @@ import { useToast } from "../lib/toast";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 const BACKEND_URL = "https://car-contact-backend.onrender.com";
-const HOLD_DURATION_MS = 3000;
+const WRITE_HOLD_DURATION_MS = 5000; // countdown shown AFTER the tag is first read
 const SKIP_LOCK_FOR_TESTING = true; // set to false before using real, final tags
 
+const KEYPAD_ROWS: (string | null)[][] = [
+  ["1", "2", "3"],
+  ["4", "5", "6"],
+  ["7", "8", "9"],
+  [null, "0", "back"],
+];
+
 // Reads the tag's current text record. Assumes an NFC technology session is
-// already open (the caller manages requestTechnology/cancelTechnologyRequest),
-// so this can be called mid-session alongside a later write.
+// already open (the caller manages requestTechnology/cancelTechnologyRequest).
 async function readTagTextRecord(): Promise<string> {
   const tag = await NfcManager.getTag();
   const ndefRecords = tag?.ndefMessage;
@@ -33,6 +39,8 @@ async function readTagTextRecord(): Promise<string> {
   return Ndef.text.decodePayload(new Uint8Array(textRecord.payload));
 }
 
+type Phase = "idle" | "scanning" | "writing";
+
 export default function AddVehicleScreen() {
   const router = useRouter();
   const { showToast } = useToast();
@@ -41,17 +49,23 @@ export default function AddVehicleScreen() {
   const [name, setName] = useState("");
   const [vehicleNumber, setVehicleNumber] = useState("");
   const [boxCode, setBoxCode] = useState("");
-  const [verifying, setVerifying] = useState(false);
+  const [phase, setPhase] = useState<Phase>("idle");
   const [countdown, setCountdown] = useState<number | null>(null);
+
+  const verifying = phase !== "idle";
 
   function handleVehicleNumberChange(text: string) {
     const cleaned = text.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
     setVehicleNumber(cleaned);
   }
 
-  function handleBoxCodeChange(text: string) {
-    const digitsOnly = text.replace(/\D/g, "").slice(0, 4);
-    setBoxCode(digitsOnly);
+  function handleKeypadPress(key: string) {
+    if (verifying) return;
+    if (key === "back") {
+      setBoxCode((c) => c.slice(0, -1));
+      return;
+    }
+    setBoxCode((c) => (c.length < 4 ? c + key : c));
   }
 
   const canSave = name.trim().length > 0 && vehicleNumber.length > 0 && boxCode.length === 4;
@@ -62,11 +76,8 @@ export default function AddVehicleScreen() {
       return;
     }
 
-    setVerifying(true);
-    setCountdown(3);
-    const countdownTimer = setInterval(() => {
-      setCountdown((c) => (c && c > 1 ? c - 1 : 0));
-    }, 1000);
+    setPhase("scanning");
+    let countdownTimer: ReturnType<typeof setInterval> | undefined;
 
     try {
       const supported = await NfcManager.isSupported();
@@ -79,16 +90,27 @@ export default function AddVehicleScreen() {
       await NfcManager.requestTechnology(NfcTech.Ndef);
 
       try {
-        // Everything below runs in ONE continuous tag session - hold the
-        // phone steady on the tag until it's done (read, verify, save, write).
-        const doWork = (async () => {
-          const decoded = await readTagTextRecord();
-          const tagCode = decoded.replace(/\D/g, "");
-          if (tagCode.length !== 4) {
-            throw new Error(`Expected a 4-digit code on the tag, got "${decoded}" instead.`);
-          }
-          const fullCode = `${boxCode}${tagCode}`;
+        // Step 1: read the tag. No countdown yet - this is just "find the tag".
+        const decoded = await readTagTextRecord();
+        const tagCode = decoded.replace(/\D/g, "");
+        if (tagCode.length !== 4) {
+          const err: any = new Error(
+            "This tag doesn't have a plain 4-digit factory code on it anymore - it may already have a saved vehicle code written to it. Use a fresh/blank tag, or erase this one first."
+          );
+          err.isVerificationError = true;
+          throw err;
+        }
+        const fullCode = `${boxCode}${tagCode}`;
 
+        // Step 2: tag found and read - NOW start the 5-second hold countdown,
+        // and use that window to verify, save, and write back to the tag.
+        setPhase("writing");
+        setCountdown(5);
+        countdownTimer = setInterval(() => {
+          setCountdown((c) => (c && c > 1 ? c - 1 : 0));
+        }, 1000);
+
+        const doWork = (async () => {
           const verifyResponse = await fetch(`${BACKEND_URL}/verify-vehicle`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -125,7 +147,7 @@ export default function AddVehicleScreen() {
           await lockTagWithPassword();
         })();
 
-        const holdForFullDuration = new Promise((resolve) => setTimeout(resolve, HOLD_DURATION_MS));
+        const holdForFullDuration = new Promise((resolve) => setTimeout(resolve, WRITE_HOLD_DURATION_MS));
         await Promise.all([doWork, holdForFullDuration]);
 
         showToast("Vehicle verified, saved, and the tag is now updated.", { title: "Success", type: "success" });
@@ -140,8 +162,8 @@ export default function AddVehicleScreen() {
         { title, type: "error" }
       );
     } finally {
-      clearInterval(countdownTimer);
-      setVerifying(false);
+      if (countdownTimer) clearInterval(countdownTimer);
+      setPhase("idle");
       setCountdown(null);
     }
   }
@@ -173,16 +195,38 @@ export default function AddVehicleScreen() {
         />
 
         <Text style={styles.label}>Box Code (4 digits)</Text>
-        <TextInput
-          style={styles.input}
-          value={boxCode}
-          onChangeText={handleBoxCodeChange}
-          placeholder="e.g. 1234"
-          placeholderTextColor="#999"
-          keyboardType="number-pad"
-          maxLength={4}
-          editable={!verifying}
-        />
+        <View style={styles.codeDisplayRow}>
+          {[0, 1, 2, 3].map((i) => (
+            <View key={i} style={[styles.codeBox, boxCode.length === i && styles.codeBoxActive]}>
+              <Text style={styles.codeBoxText}>{boxCode[i] ?? ""}</Text>
+            </View>
+          ))}
+        </View>
+
+        <View style={styles.keypad}>
+          {KEYPAD_ROWS.map((row, rowIndex) => (
+            <View key={rowIndex} style={styles.keypadRow}>
+              {row.map((key, keyIndex) => {
+                if (key === null) {
+                  return <View key={keyIndex} style={styles.keypadKeySpacer} />;
+                }
+                const isBack = key === "back";
+                return (
+                  <TouchableOpacity
+                    key={keyIndex}
+                    style={[styles.keypadKey, isBack && styles.keypadKeyMuted]}
+                    onPress={() => handleKeypadPress(key)}
+                    disabled={verifying}
+                  >
+                    <Text style={[styles.keypadKeyText, isBack && styles.keypadKeyTextMuted]}>
+                      {isBack ? "⌫" : key}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          ))}
+        </View>
 
         <TouchableOpacity
           style={[styles.verifyButton, (!canSave || verifying) && styles.verifyButtonDisabled]}
@@ -190,16 +234,26 @@ export default function AddVehicleScreen() {
           disabled={!canSave || verifying}
         >
           <Text style={styles.verifyButtonText}>
-            {verifying ? "Verifying..." : "Verify Contact Card"}
+            {phase === "scanning"
+              ? "Hold near tag..."
+              : phase === "writing"
+              ? "Writing..."
+              : "Verify Contact Card"}
           </Text>
         </TouchableOpacity>
 
-        {verifying && countdown !== null && (
+        {phase === "scanning" && (
+          <View style={styles.countdownWrapper}>
+            <Text style={styles.countdownLabel}>Hold your phone near the tag...</Text>
+          </View>
+        )}
+
+        {phase === "writing" && countdown !== null && (
           <View style={styles.countdownWrapper}>
             <View style={styles.countdownCircle}>
               <Text style={styles.countdownNumber}>{countdown}</Text>
             </View>
-            <Text style={styles.countdownLabel}>Hold your phone steady on the tag</Text>
+            <Text style={styles.countdownLabel}>Tag found - keep holding steady while it saves</Text>
           </View>
         )}
       </ScrollView>
@@ -220,12 +274,67 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     fontSize: 16,
   },
+  codeDisplayRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 14,
+    marginTop: 4,
+  },
+  codeBox: {
+    width: 52,
+    height: 58,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: "#ddd",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  codeBoxActive: {
+    borderColor: "#208AEF",
+  },
+  codeBoxText: {
+    fontSize: 24,
+    fontWeight: "700",
+    color: "#111",
+  },
+  keypad: {
+    marginTop: 20,
+    gap: 12,
+  },
+  keypadRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 16,
+  },
+  keypadKey: {
+    width: 68,
+    height: 56,
+    borderRadius: 12,
+    backgroundColor: "#f2f4f7",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  keypadKeySpacer: {
+    width: 68,
+    height: 56,
+  },
+  keypadKeyMuted: {
+    backgroundColor: "transparent",
+  },
+  keypadKeyText: {
+    fontSize: 22,
+    fontWeight: "600",
+    color: "#111",
+  },
+  keypadKeyTextMuted: {
+    color: "#999",
+  },
   verifyButton: {
     backgroundColor: "#208AEF",
     borderRadius: 12,
     paddingVertical: 16,
     alignItems: "center",
-    marginTop: 32,
+    marginTop: 28,
   },
   verifyButtonDisabled: {
     backgroundColor: "#a9c9e8",
@@ -236,7 +345,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   countdownWrapper: {
-    marginTop: 28,
+    marginTop: 24,
     alignItems: "center",
   },
   countdownCircle: {
