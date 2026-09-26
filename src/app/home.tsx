@@ -1,17 +1,21 @@
 import { Ionicons } from "@expo/vector-icons";
-import { useFocusEffect } from "@react-navigation/native";
 import * as Location from "expo-location";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   StyleSheet,
+  Switch,
   Text,
   TouchableOpacity,
   View,
 } from "react-native";
+import NfcManager, { Ndef, NfcTech } from "react-native-nfc-manager";
+import { decodeFromTag } from "../lib/tagCipher";
+import { authenticateTag } from "../lib/nfcPassword";
+import { useToast } from "../lib/toast";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 type Mode = "vehicle" | "family";
@@ -20,6 +24,9 @@ type Vehicle = {
   id: string;
   name: string;
   vehicleNumber: string;
+  parkedAt?: string | null;
+  parkedLocation?: { latitude: number; longitude: number } | null;
+  notificationsEnabled?: boolean;
 };
 
 type FamilyMember = {
@@ -31,8 +38,40 @@ type FamilyMember = {
 
 const BACKEND_URL = "https://car-contact-backend.onrender.com";
 
+async function readFullNfcCode(): Promise<string> {
+  await authenticateTag();
+  await NfcManager.requestTechnology(NfcTech.Ndef);
+  try {
+    const tag = await NfcManager.getTag();
+    const ndefRecords = tag?.ndefMessage;
+    if (!ndefRecords || ndefRecords.length === 0) {
+      throw new Error("This tag doesn't have any data written to it.");
+    }
+    const textRecord = ndefRecords.find((record) => {
+      try {
+        return Ndef.isType(record, Ndef.TNF_WELL_KNOWN, Ndef.RTD_TEXT);
+      } catch {
+        return false;
+      }
+    });
+    if (!textRecord) {
+      throw new Error("No text record found on this tag.");
+    }
+    const rawText = Ndef.text.decodePayload(new Uint8Array(textRecord.payload));
+    const decoded = decodeFromTag(rawText.trim());
+    const digitsOnly = decoded.replace(/\D/g, "");
+    if (digitsOnly.length !== 8) {
+      throw new Error("This tag's code could not be read. Make sure it was written by this app.");
+    }
+    return digitsOnly;
+  } finally {
+    await NfcManager.cancelTechnologyRequest().catch(() => {});
+  }
+}
+
 export default function HomeScreen() {
   const router = useRouter();
+  const { showToast } = useToast();
   const { phoneNumber: userPhoneNumber } = useLocalSearchParams<{ phoneNumber: string }>();
 
   const [mode, setMode] = useState<Mode>("vehicle");
@@ -45,6 +84,10 @@ export default function HomeScreen() {
 
   const [expanded, setExpanded] = useState(false);
   const [contacting, setContacting] = useState(false);
+
+  const [parkingPanelOpen, setParkingPanelOpen] = useState(false);
+  const [scanningPark, setScanningPark] = useState(false);
+  const [togglingNotifications, setTogglingNotifications] = useState(false);
 
   const hasVehicles = vehicles.length > 0;
   const hasFamilyMembers = familyMembers.length > 0;
@@ -70,6 +113,9 @@ export default function HomeScreen() {
           }
           return data.vehicles[0]?.id ?? null;
         });
+        // Park Map should already be open and visible whenever a vehicle exists,
+        // with no need to tap the button first.
+        setParkingPanelOpen(data.vehicles.length > 0);
       }
     } catch (error) {
       console.error("Could not fetch vehicles", error);
@@ -85,11 +131,13 @@ export default function HomeScreen() {
   function handleSwitchMode(newMode: Mode) {
     setMode(newMode);
     setExpanded(false);
+    setParkingPanelOpen(false);
   }
 
   function handleSelectVehicle(id: string) {
     setSelectedVehicleId(id);
     setExpanded(false);
+    setParkingPanelOpen(false);
   }
 
   function handleSelectFamilyMember(id: string) {
@@ -109,35 +157,118 @@ export default function HomeScreen() {
 
   function handleParkMap() {
     if (!selectedVehicle) return;
-    // TODO: hook up to real park map feature
-    Alert.alert("Park Map", `Showing park map for ${selectedVehicle.name}`);
+    if (parkingPanelOpen) {
+      setParkingPanelOpen(false);
+      return;
+    }
+    setParkingPanelOpen(true);
+    handleScanToMarkParking();
   }
 
   function handleRemotePark() {
     if (!selectedVehicle) return;
     // TODO: hook up to real remote park feature
-    Alert.alert("Remote Park", `Remote parking ${selectedVehicle.name}`);
+    showToast(`Remote parking ${selectedVehicle.name}`, { title: "Remote Park", type: "info" });
   }
 
-  // Vehicle mode: calls the vehicle owner (existing behavior).
-  async function handleContactOwner() {
-    setContacting(true);
+  async function handleScanToMarkParking() {
+    if (!selectedVehicle) return;
+    setScanningPark(true);
     try {
-      const response = await fetch(`${BACKEND_URL}/contact-owner`, {
+      const supported = await NfcManager.isSupported();
+      if (!supported) {
+        showToast("This device doesn't support NFC.", { title: "NFC not supported", type: "error" });
+        setScanningPark(false);
+        return;
+      }
+
+      await NfcManager.start();
+
+      const pairingCode = await readFullNfcCode();
+
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        showToast("Location permission is required to mark where you parked.", { title: "Location needed", type: "error" });
+        setScanningPark(false);
+        return;
+      }
+
+      const position = await Location.getCurrentPositionAsync({});
+      const { latitude, longitude } = position.coords;
+
+      const response = await fetch(`${BACKEND_URL}/vehicles/${selectedVehicle.id}/park`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pairingCode, latitude, longitude }),
       });
       const data = await response.json();
 
+      if (!data.success) {
+        showToast(data.error || "This tag doesn't match this vehicle.", { title: "Verification failed", type: "error" });
+        setScanningPark(false);
+        return;
+      }
+
+      showToast("We've texted you the location, and notifications are now on.", { title: "Parking marked", type: "success" });
+      await fetchVehicles();
+    } catch (error: any) {
+      showToast(error?.message || "Something went wrong while scanning.", { title: "Error", type: "error" });
+    } finally {
+      setScanningPark(false);
+    }
+  }
+
+  async function handleToggleNotifications(value: boolean) {
+    if (!selectedVehicle) return;
+    setTogglingNotifications(true);
+    try {
+      const response = await fetch(`${BACKEND_URL}/vehicles/${selectedVehicle.id}/notifications`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: value }),
+      });
+      const data = await response.json();
       if (data.success) {
-        Alert.alert("Owner notified", "The owner is being called now.");
+        await fetchVehicles();
       } else {
-        Alert.alert("Couldn't reach owner", data.message || "Please try again.");
+        showToast("Please try again.", { title: "Couldn't update", type: "error" });
       }
     } catch (error) {
-      Alert.alert("Couldn't reach owner", "Check your internet connection and try again.");
+      showToast("Check your internet connection and try again.", { title: "Couldn't update", type: "error" });
     } finally {
-      setContacting(false);
+      setTogglingNotifications(false);
     }
+  }
+
+  function handleEndPark() {
+    if (!selectedVehicle) return;
+    Alert.alert("End parking?", "Are you sure? This will clear the marked location, time, and turn off notifications.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "End Park",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            const response = await fetch(`${BACKEND_URL}/vehicles/${selectedVehicle.id}/end-park`, {
+              method: "POST",
+            });
+            const data = await response.json();
+            if (data.success) {
+              await fetchVehicles();
+            } else {
+              showToast("Please try again.", { title: "Couldn't end parking", type: "error" });
+            }
+          } catch (error) {
+            showToast("Check your internet connection and try again.", { title: "Couldn't end parking", type: "error" });
+          }
+        },
+      },
+    ]);
+  }
+
+  // Vehicle mode: opens the Contact Owner screen, which scans the tag itself.
+  function handleContactOwner() {
+    router.push({ pathname: "/contact-owner", params: { userPhoneNumber } });
   }
 
   // Family mode: calls + texts the selected family member's phone with
@@ -149,9 +280,9 @@ export default function HomeScreen() {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") {
-        Alert.alert(
-          "Location needed",
-          "Location permission is required to share your position with the relative."
+        showToast(
+          "Location permission is required to share your position with the relative.",
+          { title: "Location needed", type: "error" }
         );
         setContacting(false);
         return;
@@ -173,15 +304,15 @@ export default function HomeScreen() {
       const data = await response.json();
 
       if (data.success) {
-        Alert.alert(
-          "Relative notified",
-          `${selectedFamilyMember.name} is being called, and they'll receive your location and phone number by text.`
+        showToast(
+          `${selectedFamilyMember.name} is being called, and they'll receive your location and phone number by text.`,
+          { title: "Relative notified", type: "success" }
         );
       } else {
-        Alert.alert("Couldn't reach relative", data.message || "Please try again.");
+        showToast(data.message || "Please try again.", { title: "Couldn't reach relative", type: "error" });
       }
     } catch (error) {
-      Alert.alert("Couldn't reach relative", "Check your internet connection and try again.");
+      showToast("Check your internet connection and try again.", { title: "Couldn't reach relative", type: "error" });
     } finally {
       setContacting(false);
     }
@@ -320,6 +451,41 @@ export default function HomeScreen() {
               </Text>
             </TouchableOpacity>
           </View>
+
+          {parkingPanelOpen && selectedVehicle && (
+            <View style={styles.parkingPanel}>
+              <View style={styles.rowBetween}>
+                <Text style={styles.rowLabel}>Notifications</Text>
+                {togglingNotifications ? (
+                  <ActivityIndicator />
+                ) : (
+                  <Switch
+                    value={!!selectedVehicle.notificationsEnabled}
+                    onValueChange={handleToggleNotifications}
+                  />
+                )}
+              </View>
+
+              <View style={styles.divider} />
+
+              <Text style={styles.rowLabel}>Last marked</Text>
+              <Text style={styles.rowValue}>
+                {selectedVehicle.parkedAt
+                  ? new Date(selectedVehicle.parkedAt).toLocaleString()
+                  : "Not marked yet"}
+              </Text>
+
+              {scanningPark && (
+                <Text style={styles.rowSubvalue}>Hold your phone near the tag...</Text>
+              )}
+
+              {selectedVehicle.parkedAt && (
+                <TouchableOpacity style={styles.endParkButton} onPress={handleEndPark}>
+                  <Text style={styles.endParkButtonText}>End Park</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
         </>
       )}
 
@@ -544,6 +710,52 @@ const styles = StyleSheet.create({
   },
   actionButtonTextDisabled: {
     color: "#BBBBBB",
+  },
+  parkingPanel: {
+    marginTop: 16,
+    borderWidth: 1.5,
+    borderColor: "#E0E0E0",
+    borderRadius: 14,
+    padding: 18,
+  },
+  rowBetween: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  rowLabel: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#333",
+  },
+  rowValue: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#111",
+    marginTop: 4,
+  },
+  rowSubvalue: {
+    fontSize: 13,
+    color: "#888",
+    marginTop: 2,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: "#F0F0F0",
+    marginVertical: 16,
+  },
+  endParkButton: {
+    borderWidth: 1.5,
+    borderColor: "#D92D20",
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+    marginTop: 16,
+  },
+  endParkButtonText: {
+    color: "#D92D20",
+    fontSize: 15,
+    fontWeight: "700",
   },
   contactSection: {
     marginTop: "auto",

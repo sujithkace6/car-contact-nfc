@@ -1,48 +1,48 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useState } from "react";
-import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity } from "react-native";
+import { ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
 import NfcManager, { Ndef, NfcTech } from "react-native-nfc-manager";
+import { encodeForTag } from "../lib/tagCipher";
+import { lockTagWithPassword } from "../lib/nfcPassword";
+import { useToast } from "../lib/toast";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 const BACKEND_URL = "https://car-contact-backend.onrender.com";
+const HOLD_DURATION_MS = 3000;
+const SKIP_LOCK_FOR_TESTING = true; // set to false before using real, final tags
 
-async function readNfcTagCode(): Promise<string> {
-  await NfcManager.requestTechnology(NfcTech.Ndef);
-  try {
-    const tag = await NfcManager.getTag();
-    const ndefRecords = tag?.ndefMessage;
-    if (!ndefRecords || ndefRecords.length === 0) {
-      throw new Error("This tag doesn't have any data written to it.");
-    }
-    const textRecord = ndefRecords.find((record) => {
-      try {
-        return Ndef.isType(record, Ndef.TNF_WELL_KNOWN, Ndef.RTD_TEXT);
-      } catch {
-        return false;
-      }
-    });
-    if (!textRecord) {
-      throw new Error("No text record found on this tag.");
-    }
-    const decoded = Ndef.text.decodePayload(new Uint8Array(textRecord.payload));
-    const digitsOnly = decoded.replace(/\D/g, "");
-    if (digitsOnly.length !== 4) {
-      throw new Error(`Expected a 4-digit code on the tag, got "${decoded}" instead.`);
-    }
-    return digitsOnly;
-  } finally {
-    await NfcManager.cancelTechnologyRequest().catch(() => {});
+// Reads the tag's current text record. Assumes an NFC technology session is
+// already open (the caller manages requestTechnology/cancelTechnologyRequest),
+// so this can be called mid-session alongside a later write.
+async function readTagTextRecord(): Promise<string> {
+  const tag = await NfcManager.getTag();
+  const ndefRecords = tag?.ndefMessage;
+  if (!ndefRecords || ndefRecords.length === 0) {
+    throw new Error("This tag doesn't have any data written to it.");
   }
+  const textRecord = ndefRecords.find((record) => {
+    try {
+      return Ndef.isType(record, Ndef.TNF_WELL_KNOWN, Ndef.RTD_TEXT);
+    } catch {
+      return false;
+    }
+  });
+  if (!textRecord) {
+    throw new Error("No text record found on this tag.");
+  }
+  return Ndef.text.decodePayload(new Uint8Array(textRecord.payload));
 }
 
 export default function AddVehicleScreen() {
   const router = useRouter();
+  const { showToast } = useToast();
   const { ownerPhoneNumber } = useLocalSearchParams<{ ownerPhoneNumber: string }>();
 
   const [name, setName] = useState("");
   const [vehicleNumber, setVehicleNumber] = useState("");
   const [boxCode, setBoxCode] = useState("");
   const [verifying, setVerifying] = useState(false);
+  const [countdown, setCountdown] = useState<number | null>(null);
 
   function handleVehicleNumberChange(text: string) {
     const cleaned = text.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -58,63 +58,91 @@ export default function AddVehicleScreen() {
 
   async function handleVerifyAndSave() {
     if (!canSave) {
-      Alert.alert("Missing info", "Please fill in the name, vehicle number, and 4-digit box code.");
+      showToast("Please fill in the name, vehicle number, and 4-digit box code.", { title: "Missing info", type: "error" });
       return;
     }
 
     setVerifying(true);
+    setCountdown(3);
+    const countdownTimer = setInterval(() => {
+      setCountdown((c) => (c && c > 1 ? c - 1 : 0));
+    }, 1000);
+
     try {
       const supported = await NfcManager.isSupported();
       if (!supported) {
-        Alert.alert("NFC not supported", "This device doesn't support NFC.");
-        setVerifying(false);
+        showToast("This device doesn't support NFC.", { title: "NFC not supported", type: "error" });
         return;
       }
 
       await NfcManager.start();
-      Alert.alert("Ready to scan", "Hold your phone near the NFC tag now.");
+      await NfcManager.requestTechnology(NfcTech.Ndef);
 
-      const tagCode = await readNfcTagCode();
-      const fullCode = `${boxCode}${tagCode}`;
+      try {
+        // Everything below runs in ONE continuous tag session - hold the
+        // phone steady on the tag until it's done (read, verify, save, write).
+        const doWork = (async () => {
+          const decoded = await readTagTextRecord();
+          const tagCode = decoded.replace(/\D/g, "");
+          if (tagCode.length !== 4) {
+            throw new Error(`Expected a 4-digit code on the tag, got "${decoded}" instead.`);
+          }
+          const fullCode = `${boxCode}${tagCode}`;
 
-      const verifyResponse = await fetch(`${BACKEND_URL}/verify-vehicle`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ vehicleNumber, pairingCode: fullCode }),
-      });
-      const verifyData = await verifyResponse.json();
+          const verifyResponse = await fetch(`${BACKEND_URL}/verify-vehicle`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ vehicleNumber, pairingCode: fullCode }),
+          });
+          const verifyData = await verifyResponse.json();
+          if (!verifyData.verified) {
+            const err: any = new Error("Incorrect code.");
+            err.isVerificationError = true;
+            throw err;
+          }
 
-      if (!verifyData.verified) {
-        Alert.alert("Verification failed", "This code doesn't match this vehicle. Nothing was saved.");
-        setVerifying(false);
-        return;
+          const saveResponse = await fetch(`${BACKEND_URL}/vehicles`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name,
+              vehicleNumber,
+              pairingCode: fullCode,
+              ownerPhoneNumber,
+            }),
+          });
+          const saveData = await saveResponse.json();
+          if (!saveData.success) {
+            throw new Error(saveData.error || "Verification passed but saving failed. Please try again.");
+          }
+
+          const scrambled = encodeForTag(fullCode);
+          const bytes = Ndef.encodeMessage([Ndef.textRecord(scrambled)]);
+          await NfcManager.ndefHandler.writeNdefMessage(bytes);
+          if (!SKIP_LOCK_FOR_TESTING) {
+            await NfcManager.ndefHandler.makeReadOnly();
+          }
+          await lockTagWithPassword();
+        })();
+
+        const holdForFullDuration = new Promise((resolve) => setTimeout(resolve, HOLD_DURATION_MS));
+        await Promise.all([doWork, holdForFullDuration]);
+
+        showToast("Vehicle verified, saved, and the tag is now updated.", { title: "Success", type: "success" });
+        setTimeout(() => router.back(), 900);
+      } finally {
+        await NfcManager.cancelTechnologyRequest().catch(() => {});
       }
-
-      const saveResponse = await fetch(`${BACKEND_URL}/vehicles`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name,
-          vehicleNumber,
-          pairingCode: fullCode,
-          ownerPhoneNumber,
-        }),
-      });
-      const saveData = await saveResponse.json();
-
-      if (!saveData.success) {
-        Alert.alert("Save failed", "Verification passed but saving failed. Please try again.");
-        setVerifying(false);
-        return;
-      }
-
-      Alert.alert("Success", "Vehicle verified and saved.", [
-        { text: "OK", onPress: () => router.back() },
-      ]);
     } catch (error: any) {
-      Alert.alert("Error", error?.message || "Something went wrong while scanning.");
+      const title = error?.isVerificationError ? "Verification failed" : "Error";
+      showToast(
+        error?.message || "The tag moved away too soon - hold it steady and try again.",
+        { title, type: "error" }
+      );
     } finally {
+      clearInterval(countdownTimer);
       setVerifying(false);
+      setCountdown(null);
     }
   }
 
@@ -130,6 +158,7 @@ export default function AddVehicleScreen() {
           onChangeText={setName}
           placeholder="e.g. My Sedan"
           placeholderTextColor="#999"
+          editable={!verifying}
         />
 
         <Text style={styles.label}>Vehicle Number</Text>
@@ -140,6 +169,7 @@ export default function AddVehicleScreen() {
           placeholder="e.g. MH01BF9379"
           placeholderTextColor="#999"
           autoCapitalize="characters"
+          editable={!verifying}
         />
 
         <Text style={styles.label}>Box Code (4 digits)</Text>
@@ -151,6 +181,7 @@ export default function AddVehicleScreen() {
           placeholderTextColor="#999"
           keyboardType="number-pad"
           maxLength={4}
+          editable={!verifying}
         />
 
         <TouchableOpacity
@@ -162,6 +193,15 @@ export default function AddVehicleScreen() {
             {verifying ? "Verifying..." : "Verify Contact Card"}
           </Text>
         </TouchableOpacity>
+
+        {verifying && countdown !== null && (
+          <View style={styles.countdownWrapper}>
+            <View style={styles.countdownCircle}>
+              <Text style={styles.countdownNumber}>{countdown}</Text>
+            </View>
+            <Text style={styles.countdownLabel}>Hold your phone steady on the tag</Text>
+          </View>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -194,5 +234,28 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: 17,
     fontWeight: "700",
+  },
+  countdownWrapper: {
+    marginTop: 28,
+    alignItems: "center",
+  },
+  countdownCircle: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    borderWidth: 2,
+    borderColor: "#208AEF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+  },
+  countdownNumber: {
+    fontSize: 26,
+    fontWeight: "700",
+    color: "#208AEF",
+  },
+  countdownLabel: {
+    fontSize: 14,
+    color: "#666",
   },
 });
