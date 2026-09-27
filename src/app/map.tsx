@@ -11,20 +11,13 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import MapView, { Circle, Marker, PROVIDER_GOOGLE, Region } from "react-native-maps";
+import MapView, { Circle, Heatmap, PROVIDER_GOOGLE, Region } from "react-native-maps";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useToast } from "../lib/toast";
 
 const BACKEND_URL = "https://car-contact-backend.onrender.com";
 const RADIUS_METERS = 50;
 const EVENT_POLL_MS = 10000;
-
-// A parking spot is roughly car-sized on the ground - about 5m across.
-const CAR_SIZE_RADIUS_METERS = 2.5;
-
-// Past this zoom-out level the car-sized circles become too small to see,
-// so we switch to a clustered count marker instead.
-const CLUSTER_ZOOM_THRESHOLD = 0.006;
 
 type ParkingEvent = {
   id: string;
@@ -42,108 +35,21 @@ const DEFAULT_REGION: Region = {
   longitudeDelta: 0.02,
 };
 
-function SmokeMarker({ event }: { event: ParkingEvent }) {
-  const [phase, setPhase] = useState(0); // 0 -> 1, looping
-
-  useEffect(() => {
-    let mounted = true;
-    let start = Date.now();
-    const CYCLE_MS = 2200;
-
-    function tick() {
-      if (!mounted) return;
-      const elapsed = (Date.now() - start) % CYCLE_MS;
-      setPhase(elapsed / CYCLE_MS);
-      requestAnimationFrame(tick);
-    }
-    const frame = requestAnimationFrame(tick);
-    return () => {
-      mounted = false;
-      cancelAnimationFrame(frame);
-    };
-  }, []);
-
-  const isAvailable = event.type === "ended";
-  const color = isAvailable ? "61, 220, 132" : "255, 107, 107"; // rgb triples
-
-  // Two overlapping "puffs" at different phase offsets so the smoke feels
-  // continuous rather than a single pulse restarting abruptly.
-  const puffs = [phase, (phase + 0.5) % 1];
-
-  return (
-    <>
-      {puffs.map((p, i) => {
-        const radius = CAR_SIZE_RADIUS_METERS * (0.6 + p * 0.9);
-        const opacity = 0.5 * (1 - p);
-        return (
-          <Circle
-            key={i}
-            center={{ latitude: event.latitude, longitude: event.longitude }}
-            radius={radius}
-            strokeWidth={0}
-            fillColor={`rgba(${color}, ${opacity})`}
-          />
-        );
-      })}
-      <Circle
-        center={{ latitude: event.latitude, longitude: event.longitude }}
-        radius={CAR_SIZE_RADIUS_METERS * 0.55}
-        strokeWidth={1}
-        strokeColor={`rgba(${color}, 0.9)`}
-        fillColor={`rgba(${color}, 0.35)`}
-      />
-    </>
-  );
-}
-
-function CountMarker({
-  coordinate,
-  count,
-  color,
-}: {
-  coordinate: { latitude: number; longitude: number };
-  count: number;
-  color: string;
-}) {
-  return (
-    <Marker coordinate={coordinate} anchor={{ x: 0.5, y: 1 }} tracksViewChanges={false}>
-      <View style={styles.clusterWrapper}>
-        <View style={[styles.clusterBadge, { backgroundColor: color }]}>
-          <Text style={styles.clusterBadgeText}>{count}</Text>
-        </View>
-        <Ionicons name="caret-down" size={20} color={color} style={styles.clusterArrow} />
-      </View>
-    </Marker>
-  );
-}
-
-type Cluster = { latitude: number; longitude: number; count: number; type: "started" | "ended" };
-
-// Simple grid-based clustering: group same-type events into cells sized off
-// the current zoom level, and represent each group by its centroid + count.
-function clusterEvents(events: ParkingEvent[], cellSize: number): Cluster[] {
-  const groups = new Map<string, { sumLat: number; sumLng: number; count: number; type: "started" | "ended" }>();
-
-  for (const event of events) {
-    const cellLat = Math.round(event.latitude / cellSize);
-    const cellLng = Math.round(event.longitude / cellSize);
-    const key = `${event.type}:${cellLat}:${cellLng}`;
-    const existing = groups.get(key);
-    if (existing) {
-      existing.sumLat += event.latitude;
-      existing.sumLng += event.longitude;
-      existing.count += 1;
-    } else {
-      groups.set(key, { sumLat: event.latitude, sumLng: event.longitude, count: 1, type: event.type });
-    }
+// Free, no-API-key forward geocoding (OpenStreetMap Nominatim), since the
+// device's native Geocoder can be unreliable/absent depending on the phone.
+async function geocodeArea(query: string): Promise<{ latitude: number; longitude: number } | null> {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+  const response = await fetch(url, {
+    headers: { "User-Agent": "car-contact-nfc/1.0" },
+  });
+  if (!response.ok) {
+    throw new Error(`Search request failed (${response.status}).`);
   }
-
-  return Array.from(groups.values()).map((g) => ({
-    latitude: g.sumLat / g.count,
-    longitude: g.sumLng / g.count,
-    count: g.count,
-    type: g.type,
-  }));
+  const results = await response.json();
+  if (!Array.isArray(results) || results.length === 0) {
+    return null;
+  }
+  return { latitude: parseFloat(results[0].lat), longitude: parseFloat(results[0].lon) };
 }
 
 export default function MapScreen() {
@@ -157,7 +63,29 @@ export default function MapScreen() {
   const [radiusVisible, setRadiusVisible] = useState(false);
   const [radiusCenter, setRadiusCenter] = useState<{ latitude: number; longitude: number } | null>(null);
   const [locatingRadius, setLocatingRadius] = useState(false);
-  const [region, setRegion] = useState<Region>(DEFAULT_REGION);
+  const [locatingMe, setLocatingMe] = useState(false);
+
+  // Gentle "breathing" pulse driving the heatmap radius, so the smoke feels
+  // alive rather than a static blob.
+  const [pulse, setPulse] = useState(0);
+
+  useEffect(() => {
+    let mounted = true;
+    let start = Date.now();
+    const CYCLE_MS = 3200;
+
+    function tick() {
+      if (!mounted) return;
+      const elapsed = (Date.now() - start) % CYCLE_MS;
+      setPulse(elapsed / CYCLE_MS);
+      requestAnimationFrame(tick);
+    }
+    const frame = requestAnimationFrame(tick);
+    return () => {
+      mounted = false;
+      cancelAnimationFrame(frame);
+    };
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -205,20 +133,44 @@ export default function MapScreen() {
     Keyboard.dismiss();
     setSearching(true);
     try {
-      const results = await Location.geocodeAsync(searchText.trim());
-      if (results.length === 0) {
+      const result = await geocodeArea(searchText.trim());
+      if (!result) {
         showToast("Couldn't find that place - try a different search.", { title: "No results", type: "error" });
         return;
       }
-      const { latitude, longitude } = results[0];
       mapRef.current?.animateToRegion(
-        { latitude, longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 },
+        { ...result, latitudeDelta: 0.01, longitudeDelta: 0.01 },
         400
       );
     } catch (error) {
       showToast("Search failed. Check your internet connection.", { title: "Error", type: "error" });
     } finally {
       setSearching(false);
+    }
+  }
+
+  async function handleGoToCurrentLocation() {
+    setLocatingMe(true);
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        showToast("Location permission is required to find you.", { title: "Location needed", type: "error" });
+        return;
+      }
+      const position = await Location.getCurrentPositionAsync({});
+      mapRef.current?.animateToRegion(
+        {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        },
+        400
+      );
+    } catch (error) {
+      showToast("Couldn't get your location.", { title: "Error", type: "error" });
+    } finally {
+      setLocatingMe(false);
     }
   }
 
@@ -245,6 +197,16 @@ export default function MapScreen() {
     }
   }
 
+  const redPoints = events
+    .filter((e) => e.type === "started")
+    .map((e) => ({ latitude: e.latitude, longitude: e.longitude, weight: 1 }));
+  const greenPoints = events
+    .filter((e) => e.type === "ended")
+    .map((e) => ({ latitude: e.latitude, longitude: e.longitude, weight: 1 }));
+
+  // Breathing radius: oscillates gently so the smoke feels like it's drifting.
+  const heatmapRadius = 32 + Math.sin(pulse * Math.PI * 2) * 8;
+
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
       <View style={styles.searchBar}>
@@ -270,7 +232,6 @@ export default function MapScreen() {
         style={styles.map}
         provider={PROVIDER_GOOGLE}
         initialRegion={DEFAULT_REGION}
-        onRegionChangeComplete={setRegion}
         showsUserLocation
         showsMyLocationButton={false}
       >
@@ -284,17 +245,40 @@ export default function MapScreen() {
           />
         )}
 
-        {region.latitudeDelta > CLUSTER_ZOOM_THRESHOLD
-          ? clusterEvents(events, region.latitudeDelta / 8).map((cluster, i) => (
-              <CountMarker
-                key={i}
-                coordinate={cluster}
-                count={cluster.count}
-                color={cluster.type === "ended" ? "#3DDC84" : "#FF6B6B"}
-              />
-            ))
-          : events.map((event) => <SmokeMarker key={event.id} event={event} />)}
+        {redPoints.length > 0 && (
+          <Heatmap
+            points={redPoints}
+            radius={heatmapRadius}
+            opacity={0.75}
+            gradient={{
+              colors: ["rgba(255,107,107,0)", "#FF9E9E", "#FF6B6B", "#D93E3E"],
+              startPoints: [0.05, 0.4, 0.75, 1],
+              colorMapSize: 256,
+            }}
+          />
+        )}
+
+        {greenPoints.length > 0 && (
+          <Heatmap
+            points={greenPoints}
+            radius={heatmapRadius}
+            opacity={0.75}
+            gradient={{
+              colors: ["rgba(61,220,132,0)", "#8FE8B4", "#3DDC84", "#22A85C"],
+              startPoints: [0.05, 0.4, 0.75, 1],
+              colorMapSize: 256,
+            }}
+          />
+        )}
       </MapView>
+
+      <TouchableOpacity style={styles.myLocationButton} onPress={handleGoToCurrentLocation} disabled={locatingMe}>
+        {locatingMe ? (
+          <ActivityIndicator size="small" color="#111111" />
+        ) : (
+          <Ionicons name="locate" size={22} color="#111111" />
+        )}
+      </TouchableOpacity>
 
       <TouchableOpacity style={styles.radiusButton} onPress={handleShowRadius} disabled={locatingRadius}>
         {locatingRadius ? (
@@ -354,6 +338,22 @@ const styles = StyleSheet.create({
   map: {
     flex: 1,
   },
+  myLocationButton: {
+    position: "absolute",
+    bottom: 96,
+    right: 20,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 6,
+  },
   radiusButton: {
     position: "absolute",
     bottom: 96,
@@ -396,31 +396,5 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#333333",
     fontWeight: "500",
-  },
-  clusterWrapper: {
-    alignItems: "center",
-  },
-  clusterBadge: {
-    minWidth: 26,
-    height: 26,
-    borderRadius: 13,
-    paddingHorizontal: 6,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1.5,
-    borderColor: "#FFFFFF",
-    shadowColor: "#000",
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 4,
-  },
-  clusterBadgeText: {
-    color: "#FFFFFF",
-    fontSize: 12,
-    fontWeight: "700",
-  },
-  clusterArrow: {
-    marginTop: -3,
   },
 });
