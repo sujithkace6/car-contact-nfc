@@ -11,7 +11,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import MapView, { Circle, PROVIDER_GOOGLE, Region } from "react-native-maps";
+import MapView, { Circle, Marker, PROVIDER_GOOGLE, Region } from "react-native-maps";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useToast } from "../lib/toast";
 
@@ -21,6 +21,10 @@ const EVENT_POLL_MS = 10000;
 
 // A parking spot is roughly car-sized on the ground - about 5m across.
 const CAR_SIZE_RADIUS_METERS = 2.5;
+
+// Past this zoom-out level the car-sized circles become too small to see,
+// so we switch to a clustered count marker instead.
+const CLUSTER_ZOOM_THRESHOLD = 0.006;
 
 type ParkingEvent = {
   id: string;
@@ -92,6 +96,56 @@ function SmokeMarker({ event }: { event: ParkingEvent }) {
   );
 }
 
+function CountMarker({
+  coordinate,
+  count,
+  color,
+}: {
+  coordinate: { latitude: number; longitude: number };
+  count: number;
+  color: string;
+}) {
+  return (
+    <Marker coordinate={coordinate} anchor={{ x: 0.5, y: 1 }} tracksViewChanges={false}>
+      <View style={styles.clusterWrapper}>
+        <View style={[styles.clusterBadge, { backgroundColor: color }]}>
+          <Text style={styles.clusterBadgeText}>{count}</Text>
+        </View>
+        <Ionicons name="caret-down" size={20} color={color} style={styles.clusterArrow} />
+      </View>
+    </Marker>
+  );
+}
+
+type Cluster = { latitude: number; longitude: number; count: number; type: "started" | "ended" };
+
+// Simple grid-based clustering: group same-type events into cells sized off
+// the current zoom level, and represent each group by its centroid + count.
+function clusterEvents(events: ParkingEvent[], cellSize: number): Cluster[] {
+  const groups = new Map<string, { sumLat: number; sumLng: number; count: number; type: "started" | "ended" }>();
+
+  for (const event of events) {
+    const cellLat = Math.round(event.latitude / cellSize);
+    const cellLng = Math.round(event.longitude / cellSize);
+    const key = `${event.type}:${cellLat}:${cellLng}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.sumLat += event.latitude;
+      existing.sumLng += event.longitude;
+      existing.count += 1;
+    } else {
+      groups.set(key, { sumLat: event.latitude, sumLng: event.longitude, count: 1, type: event.type });
+    }
+  }
+
+  return Array.from(groups.values()).map((g) => ({
+    latitude: g.sumLat / g.count,
+    longitude: g.sumLng / g.count,
+    count: g.count,
+    type: g.type,
+  }));
+}
+
 export default function MapScreen() {
   const router = useRouter();
   const { showToast } = useToast();
@@ -103,6 +157,7 @@ export default function MapScreen() {
   const [radiusVisible, setRadiusVisible] = useState(false);
   const [radiusCenter, setRadiusCenter] = useState<{ latitude: number; longitude: number } | null>(null);
   const [locatingRadius, setLocatingRadius] = useState(false);
+  const [region, setRegion] = useState<Region>(DEFAULT_REGION);
 
   useEffect(() => {
     (async () => {
@@ -215,6 +270,7 @@ export default function MapScreen() {
         style={styles.map}
         provider={PROVIDER_GOOGLE}
         initialRegion={DEFAULT_REGION}
+        onRegionChangeComplete={setRegion}
         showsUserLocation
         showsMyLocationButton={false}
       >
@@ -228,9 +284,16 @@ export default function MapScreen() {
           />
         )}
 
-        {events.map((event) => (
-          <SmokeMarker key={event.id} event={event} />
-        ))}
+        {region.latitudeDelta > CLUSTER_ZOOM_THRESHOLD
+          ? clusterEvents(events, region.latitudeDelta / 8).map((cluster, i) => (
+              <CountMarker
+                key={i}
+                coordinate={cluster}
+                count={cluster.count}
+                color={cluster.type === "ended" ? "#3DDC84" : "#FF6B6B"}
+              />
+            ))
+          : events.map((event) => <SmokeMarker key={event.id} event={event} />)}
       </MapView>
 
       <TouchableOpacity style={styles.radiusButton} onPress={handleShowRadius} disabled={locatingRadius}>
@@ -333,5 +396,31 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#333333",
     fontWeight: "500",
+  },
+  clusterWrapper: {
+    alignItems: "center",
+  },
+  clusterBadge: {
+    minWidth: 26,
+    height: 26,
+    borderRadius: 13,
+    paddingHorizontal: 6,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1.5,
+    borderColor: "#FFFFFF",
+    shadowColor: "#000",
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
+  clusterBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  clusterArrow: {
+    marginTop: -3,
   },
 });

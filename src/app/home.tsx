@@ -220,6 +220,27 @@ export default function HomeScreen() {
 
       const pairingCode = await readFullNfcCode();
 
+      // If this vehicle is already parked, scanning the tag a second time
+      // ends parking instead of re-marking it - the tag acts as a toggle.
+      if (vehicle.parkedAt) {
+        const endResponse = await fetch(`${BACKEND_URL}/vehicles/${vehicle.id}/end-park`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pairingCode }),
+        });
+        const endData = await endResponse.json();
+
+        if (!endData.success) {
+          showToast(endData.error || "This tag doesn't match this vehicle.", { title: "Verification failed", type: "error" });
+          setScanningPark(false);
+          return;
+        }
+
+        showToast("Parking ended.", { title: "Ended", type: "success" });
+        await fetchVehicles();
+        return;
+      }
+
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") {
         showToast("Location permission is required to mark where you parked.", { title: "Location needed", type: "error" });
