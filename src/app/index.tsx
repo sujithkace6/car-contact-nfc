@@ -11,6 +11,10 @@ import {
 } from "react-native";
 import { useRouter } from "expo-router";
 import { sendOtp } from "@/lib/api";
+
+// TEMPORARY: skips the SMS OTP step entirely so you can jump straight to
+// Home with just a phone number. Flip back to false to restore real OTP.
+const DEV_SKIP_OTP = true;
 import { useToast } from "@/lib/toast";
 
 const COUNTRY_CODE = "+91";
@@ -29,6 +33,14 @@ export default function PhoneEntryScreen() {
     if (!canSubmit) return;
 
     const fullPhoneNumber = `${COUNTRY_CODE}${phone.trim()}`;
+
+    if (DEV_SKIP_OTP) {
+      // Use the SAME phone number you've saved vehicles under, so Home
+      // still shows what you already added.
+      router.push({ pathname: "/home", params: { phoneNumber: fullPhoneNumber } });
+      return;
+    }
+
     setLoading(true);
 
     const result = await sendOtp(fullPhoneNumber);
