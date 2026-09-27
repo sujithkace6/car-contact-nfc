@@ -540,6 +540,11 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
 
+          <TouchableOpacity style={styles.mapButton} onPress={() => router.push("/map")}>
+            <Ionicons name="map-outline" size={18} color="#111111" />
+            <Text style={styles.mapButtonText}>Nearby Parking Map</Text>
+          </TouchableOpacity>
+
           {parkingPanelOpen && selectedVehicle && (
             <View style={styles.parkingPanel}>
               <View style={styles.rowBetween}>
@@ -788,6 +793,22 @@ const styles = StyleSheet.create({
   actionsSection: {
     flexDirection: "row",
     gap: 12,
+  },
+  mapButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    borderWidth: 1.5,
+    borderColor: "#E0E0E0",
+    borderRadius: 12,
+    paddingVertical: 14,
+    marginTop: 12,
+  },
+  mapButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#111111",
   },
   actionButton: {
     flex: 1,

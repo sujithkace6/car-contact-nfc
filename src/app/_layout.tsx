@@ -12,6 +12,7 @@ export default function RootLayout() {
           <Stack.Screen name="home" />
           <Stack.Screen name="add-family-member" />
           <Stack.Screen name="add-vehicle" options={{ headerShown: true, title: 'Add Vehicle' }} />
+          <Stack.Screen name="map" />
         </Stack>
       </ConfirmProvider>
     </ToastProvider>

@@ -9,7 +9,10 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "com.jetconwoy.carcontactnfc"
+      "bundleIdentifier": "com.jetconwoy.carcontactnfc",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "This app uses your location to mark and show parking spots on the map."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -20,9 +23,15 @@
       },
       "predictiveBackGestureEnabled": false,
       "permissions": [
-        "android.permission.NFC"
+        "android.permission.NFC",
+        "android.permission.ACCESS_FINE_LOCATION"
       ],
-      "package": "com.jetconwoy.carcontactnfc"
+      "package": "com.jetconwoy.carcontactnfc",
+      "config": {
+        "googleMaps": {
+          "apiKey": "REPLACE_WITH_YOUR_GOOGLE_MAPS_API_KEY"
+        }
+      }
     },
     "web": {
       "output": "static",
